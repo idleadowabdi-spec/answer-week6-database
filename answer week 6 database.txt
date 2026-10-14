@@ -1,0 +1,443 @@
+# HANDS-ON LAB REPORT
+## BACKUPS, POINT-IN-TIME RECOVERY (PITR), AND REPLICATION
+
+**Course:** Database Management Systems  
+**Topic:** PostgreSQL Backup, Recovery, and Replication  
+**Practical Title:** Hands-On Lab: Backups, Point-in-Time Recovery, and Replication
+
+## 1. Introduction
+
+Database backup and recovery are important activities in database administration. They help protect information against accidental deletion, hardware failure, software errors, and other unexpected disasters.
+
+PostgreSQL provides several tools for database protection. These include `pg_dump` for logical backups, WAL archiving for point-in-time recovery, `pg_basebackup` for physical backups, and streaming replication for maintaining a standby server.
+
+This practical demonstrates how to back up the `bootcamp` database, configure WAL archiving, recover data after simulated deletion, and configure a standby server to receive changes from a primary server.
+
+## 2. Objectives
+
+The objectives of this practical are to:
+
+1. Create and verify a logical database backup.
+2. Configure PostgreSQL Write-Ahead Log (WAL) archiving.
+3. Create a physical base backup.
+4. Perform point-in-time recovery after simulated data loss.
+5. Create a replication user and configure a standby server.
+6. Monitor replication status and measure replication lag.
+7. Understand the importance of database backup and disaster recovery.
+
+## 3. Requirements
+
+The following tools and resources are required:
+
+- PostgreSQL database server.
+- PostgreSQL client tools.
+- Terminal or command-line interface.
+- Administrative privileges for PostgreSQL configuration.
+- A test database named `bootcamp`.
+- Sufficient disk space for backups and WAL files.
+- A separate test data directory or server for recovery and replication.
+
+**Safety note:** Perform destructive recovery operations only in a disposable test environment. A base backup and its WAL archive must be suitable for the same recovery chain.
+
+## 4. Step One: Create and Verify a Logical Backup
+
+### 4.1 Meaning of a logical backup
+
+A logical backup stores database objects and data in a format that can be restored using PostgreSQL tools. It is useful for migrating databases, copying data, and recovering individual databases.
+
+### 4.2 Create the backup directory
+
+```bash
+mkdir -p ~/backups
+```
+
+This command creates a directory named `backups` inside the current user's home directory.
+
+### 4.3 Back up the database
+
+```bash
+pg_dump -Fc -f ~/backups/bootcamp.dump bootcamp
+```
+
+**Explanation:**
+
+- `pg_dump` creates a logical backup.
+- `-Fc` selects the custom archive format.
+- `-f` specifies the output filename.
+- `bootcamp` is the database being backed up.
+
+### 4.4 Verify the backup
+
+```bash
+pg_restore --list ~/backups/bootcamp.dump | head
+```
+
+This command displays the first entries in the backup archive's table of contents.
+
+### 4.5 Restore the backup into a test database
+
+```bash
+createdb bootcamp_check
+pg_restore -d bootcamp_check ~/backups/bootcamp.dump
+```
+
+If the commands complete successfully, inspect the restored database:
+
+```bash
+psql -d bootcamp_check
+```
+
+Inside PostgreSQL, run:
+
+```sql
+\dt
+```
+
+This lists the tables available in the restored database.
+
+**Expected result:** The backup archive can be read and the database objects and data are restored into `bootcamp_check`.
+
+## 5. Step Two: Enable WAL Archiving
+
+### 5.1 Meaning of WAL
+
+Write-Ahead Logging is a PostgreSQL mechanism that records database changes before those changes are written permanently to the data files.
+
+WAL records support crash recovery, physical replication, and point-in-time recovery.
+
+### 5.2 Locate the PostgreSQL configuration file
+
+Connect to PostgreSQL:
+
+```bash
+sudo -u postgres psql
+```
+
+Execute:
+
+```sql
+SHOW config_file;
+SHOW data_directory;
+```
+
+Record the paths shown, then exit:
+
+```sql
+\q
+```
+
+### 5.3 Create the WAL archive directory
+
+For a typical Linux installation:
+
+```bash
+sudo mkdir -p /var/lib/postgresql/wal_archive
+sudo chown postgres:postgres /var/lib/postgresql/wal_archive
+sudo chmod 700 /var/lib/postgresql/wal_archive
+```
+
+The PostgreSQL service account needs permission to write archived WAL files to this directory.
+
+### 5.4 Configure `postgresql.conf`
+
+Edit the configuration file and set the following parameters:
+
+```conf
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /var/lib/postgresql/wal_archive/%f && cp %p /var/lib/postgresql/wal_archive/%f'
+```
+
+**Explanation:**
+
+- `wal_level = replica` enables the WAL information required for physical replication.
+- `archive_mode = on` enables WAL archiving.
+- `archive_command` copies completed WAL files to the archive directory.
+
+The archive command avoids replacing an existing file with the same name.
+
+### 5.5 Restart PostgreSQL
+
+On a system using systemd:
+
+```bash
+sudo systemctl restart postgresql
+sudo systemctl status postgresql
+```
+
+Some PostgreSQL installations use version-specific service names or containers, so the restart command may differ.
+
+### 5.6 Verify WAL archiving
+
+Connect to PostgreSQL and run:
+
+```sql
+SHOW archive_mode;
+SHOW archive_command;
+```
+
+To inspect archiving statistics:
+
+```sql
+SELECT archived_count, last_archived_wal,
+       last_archived_time, failed_count
+FROM pg_stat_archiver;
+```
+
+**Expected result:** Archiving is enabled, the archive command is configured, and the statistics show successful archiving when WAL segments have been completed and archived.
+
+## 6. Step Three: Take a Physical Base Backup
+
+### 6.1 Meaning of a base backup
+
+A base backup is a physical copy of the PostgreSQL cluster's data files. It provides the starting point for restoring the cluster and replaying the necessary WAL records.
+
+### 6.2 Create the backup directory
+
+```bash
+sudo -u postgres mkdir -p /var/lib/postgresql/base_backup
+```
+
+### 6.3 Take the base backup
+
+```bash
+sudo -u postgres pg_basebackup \
+  -D /var/lib/postgresql/base_backup \
+  -Fp -Xs -P
+```
+
+**Explanation:**
+
+- `-D` specifies the destination directory.
+- `-Fp` requests plain-format output.
+- `-Xs` streams the WAL needed during the backup.
+- `-P` displays progress.
+
+**Expected result:** PostgreSQL creates a physical base backup in the specified directory.
+
+A base backup alone does not guarantee point-in-time recovery. You must also preserve the WAL records required to reach the desired recovery time.
+
+## 7. Step Four: Simulate a Disaster and Perform PITR
+
+### 7.1 Meaning of Point-in-Time Recovery
+
+Point-in-Time Recovery (PITR) allows a PostgreSQL database cluster to be restored to a selected time before an unwanted change, such as accidental deletion.
+
+PITR normally requires:
+
+1. A suitable physical base backup.
+2. A continuous, usable sequence of WAL files from the backup through the desired recovery point.
+3. A configured recovery target.
+
+### 7.2 Prepare a test table
+
+Perform this step only in the test database, not on important data.
+
+```sql
+CREATE TABLE students (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL
+);
+
+INSERT INTO students (name)
+VALUES ('Ahmed'), ('Fatima'), ('Ali');
+
+SELECT * FROM students;
+```
+
+### 7.3 Record a recovery target and simulate deletion
+
+For a controlled test, record the time before deleting the records:
+
+```sql
+SELECT clock_timestamp();
+```
+
+Write down the timestamp with its time zone if shown. Then simulate the accident:
+
+```sql
+DELETE FROM students;
+```
+
+Verify the deletion:
+
+```sql
+SELECT COUNT(*) FROM students;
+```
+
+The count should be zero if the table originally contained only those three rows.
+
+### 7.4 Recovery procedure
+
+**Important:** The following steps require a dedicated test cluster. Do not overwrite your normal PostgreSQL data directory.
+
+1. Stop the test PostgreSQL instance.
+2. Preserve the damaged data directory for investigation.
+3. Restore the appropriate physical base backup into the test cluster's data directory.
+4. Configure the test cluster to retrieve archived WAL files using `restore_command`.
+5. Configure the appropriate recovery target using `recovery_target_time`.
+6. Configure PostgreSQL to stop at the intended recovery target, where appropriate.
+7. Start the test cluster and inspect the recovery logs.
+
+Example recovery settings for a compatible PostgreSQL version:
+
+```conf
+restore_command = 'cp /var/lib/postgresql/wal_archive/%f %p'
+recovery_target_time = '2026-10-14 12:00:00+03'
+recovery_target_action = 'pause'
+```
+
+Replace the example timestamp with the actual target time recorded for your test. These parameters belong in the recovery configuration, not in a SQL query. Recovery setup also requires the appropriate recovery signal file, such as `recovery.signal`, depending on the PostgreSQL version.
+
+For a real PITR exercise, the selected target must be after the base backup's starting point and before the deletion transaction commits. If the deletion was committed before the chosen target, the deleted rows will not reappear.
+
+### 7.5 Verify the recovered data
+
+After recovery pauses at the target, connect to the test database and run:
+
+```sql
+SELECT COUNT(*) FROM students;
+SELECT * FROM students;
+```
+
+**Expected result:** If the recovery target is correctly selected before the deletion, the original student records should be present.
+
+After verifying the recovery, complete the recovery process according to your lab's requirements.
+
+## 8. Step Five: Configure Streaming Replication
+
+### 8.1 Meaning of streaming replication
+
+Streaming replication transfers WAL records from a primary PostgreSQL server to a standby server. The standby replays those records to maintain a copy of the primary database cluster.
+
+Streaming replication can improve availability and support disaster recovery.
+
+### 8.2 Create a replication user
+
+On the primary server, run:
+
+```sql
+CREATE ROLE replicator
+WITH REPLICATION LOGIN PASSWORD 'replace_with_a_strong_password';
+```
+
+Use a strong, private password rather than the example password from a public lab sheet.
+
+### 8.3 Configure `pg_hba.conf`
+
+Add an appropriate host-based authentication rule for the standby server. For a standby connecting from the same machine:
+
+```conf
+host replication replicator 127.0.0.1/32 scram-sha-256
+```
+
+This rule permits the replication account to connect over IPv4 loopback using SCRAM authentication, provided the account and server authentication settings support it.
+
+Reload the PostgreSQL configuration after making the change:
+
+```sql
+SELECT pg_reload_conf();
+```
+
+### 8.4 Create the standby data directory
+
+The standby must use a separate, empty data directory and a separate PostgreSQL instance or server.
+
+For example:
+
+```bash
+mkdir -p ~/standby
+chmod 700 ~/standby
+```
+
+Ensure the directory is owned by the operating-system account that runs the standby PostgreSQL service.
+
+### 8.5 Take a base backup for the standby
+
+Run this from the standby host or environment:
+
+```bash
+pg_basebackup \
+  -h 127.0.0.1 \
+  -U replicator \
+  -D ~/standby \
+  -R -P
+```
+
+**Explanation:**
+
+- `-h` specifies the primary server address.
+- `-U` specifies the replication user.
+- `-D` specifies the standby data directory.
+- `-R` creates the standby configuration needed for replication.
+- `-P` displays backup progress.
+
+The standby also needs valid network connectivity, authentication, and a suitable PostgreSQL installation. If the primary and standby run on different machines, replace `127.0.0.1` with the primary server's reachable address.
+
+## 9. Step Six: Monitor Replication Health
+
+### 9.1 Check replication status on the primary
+
+Run:
+
+```sql
+SELECT application_name,
+       state,
+       sent_lsn,
+       write_lsn,
+       flush_lsn,
+       replay_lsn,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+```
+
+**Explanation:**
+
+- `application_name` identifies the connected standby.
+- `state` reports the replication state.
+- `sent_lsn` indicates the WAL location sent by the primary.
+- `write_lsn` indicates the WAL location written by the standby.
+- `flush_lsn` indicates the WAL location flushed to durable storage.
+- `replay_lsn` indicates the WAL location replayed by the standby.
+- `lag_bytes` estimates the difference between the sent and replayed WAL positions.
+
+If no standby is connected, the query may return no rows.
+
+### 9.2 Check the standby's recovery status
+
+On the standby, run:
+
+```sql
+SELECT pg_is_in_recovery();
+```
+
+A result of `true` indicates that PostgreSQL is operating as a standby in recovery mode.
+
+To inspect received and replayed WAL positions, run:
+
+```sql
+SELECT pg_last_wal_receive_lsn(),
+       pg_last_wal_replay_lsn();
+```
+
+A healthy replication setup should show an active connection on the primary and continuing WAL reception and replay on the standby.
+
+## 10. Common Problems and Solutions
+
+| Problem | Possible solution |
+|---|---|
+| Database does not exist | Confirm the database name using `psql -l`. |
+| Permission denied | Check the operating-system and PostgreSQL user permissions. |
+| WAL archiving fails | Check `archive_command`, directory permissions, and PostgreSQL logs. |
+| Base backup fails | Check connectivity, replication privileges, disk space, and authentication. |
+| PITR restores the wrong state | Check the recovery timestamp and ensure all required WAL files are available. |
+| Standby does not connect | Check the primary address, port, `pg_hba.conf`, credentials, and firewall rules. |
+| Replication query returns no rows | Confirm that the standby is running and connected to the primary. |
+
+## 11. Results and Discussion
+
+The lab demonstrates the roles of logical backups, physical backups, WAL archiving, point-in-time recovery, and streaming replication.
+
+A logical backup supports restoring a database into a separate database for testing. A physical base backup provides the starting point for cluster-level recovery. Archived WAL records allow PostgreSQL to replay database changes up to a selected recovery point. Streaming replication maintains a standby copy of the primary cluster.
+
+Actual success must be confirmed by executing the commands,
